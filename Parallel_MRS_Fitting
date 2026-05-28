@@ -1,0 +1,433 @@
+#!/bin/bash
+
+# TEMPLATE: Parallel MRS Fitting with Core Pinning for Hybrid CPU Architecture
+# Author: Arijit Bhattacharya, Department of Psychology and Cognitive Sciences, Ashoka University
+# Description: Process dynamic MRS scans in parallel with optimal CPU core pinning
+#              and thread control for maximum performance on modern CPUs
+# 
+# HOW TO USE THIS TEMPLATE:
+# 1. Copy this file to your working directory
+# 2. Edit the "USER CONFIGURATION SECTION" below with your paths and settings
+# 3. Run: chmod +x this_script.sh && ./this_script.sh
+
+# USER CONFIGURATION SECTION - EDIT THESE PATHS AND SETTINGS
+
+# INPUT/OUTPUT PATHS (MUST EDIT) 
+BASE_DATA_DIR="/path/to/your/preprocessed/dynamic/data"
+# Contains preprocessed dynamic MRS data (e.g., processed_dyn_XX.nii.gz)
+
+BASE_REF_DIR="/path/to/your/reference/scans"
+# Contains water reference scans (e.g., Ref_XX.nii.gz) for quantification
+
+OUTPUT_BASE="/path/to/your/output/folder"
+# Directory where fitted results will be saved (separate subfolder per dynamic)
+
+BASIS_DIR="/path/to/your/basis/set"
+# Contains basis set files for metabolite fitting
+
+TISSUE_JSON="/path/to/your/tissue/segmentation.json"
+# JSON file with tissue fraction information for partial volume correction
+
+#  PROCESSING PARAMETERS 
+NUM_DYNAMICS=20                    # Total number of dynamic scans to process (1 to N)
+DYNAMIC_PREFIX="FSL_HLSVD_Step_2_processed_dyn_"  # Prefix before dynamic number
+DYNAMIC_SUFFIX="_hlsvd_hlsvd_A.nii.gz"             # Suffix after dynamic number
+REF_PREFIX="Ref_"                  # Prefix before reference scan number
+REF_SUFFIX=".nii.gz"               # Suffix after reference scan number
+
+# MRS FITTING PARAMETERS 
+ALGO="MH"                          # Fitting algorithm (MH, LL, etc.)
+TE=30                              # Echo time in milliseconds
+TR=2                               # Repetition time in seconds
+MH_SAMPLES=10000                   # Number of MH sampling iterations
+PPM_LIMIT="0.2 4.0"                # Spectral range for fitting (low high)
+
+# METABOLITE COMBINATIONS 
+# Format: list of "name1 name2" pairs to combine
+COMBINATIONS=(
+    "NAA NAAG"
+    "mI Gly"
+    "Cr PCr"
+    "Glu Gln"
+    "GPC PCh"
+)
+
+# MACROMOLECULE GROUPS 
+METAB_GROUPS=("MM09" "MM12" "MM14" "MM17" "MM21")
+IND_SCALE_GROUPS=("MM09" "MM12" "MM14" "MM17" "MM21")
+
+#  BASELINE SETTINGS 
+BASELINE_TYPE="spline"             # spline, polynomial, etc.
+BASELINE_STIFFNESS="stiff"         # stiff, flexible, etc.
+
+# OUTPUT OPTIONS 
+GENERATE_REPORT=true               # Generate HTML report
+EXPORT_SEPARATE=true               # Export individual metabolite fits
+EXPORT_BASELINE=true               # Export fitted baseline
+EXPORT_NO_BASELINE=true            # Export spectra without baseline
+VERBOSE=true                       # Print detailed progress messages
+
+# CPU CONFIGURATION - Auto-detect or manually specify
+
+# METHOD 1: AUTO-DETECT OPTIMAL CORES (RECOMMENDED) 
+# This automatically finds the best cores to use on your system
+AUTO_DETECT_CORES=true             # Set to true for auto-detection
+
+# METHOD 2: MANUAL CORE SPECIFICATION 
+# If AUTO_DETECT_CORES=false, specify cores manually:
+# For hybrid CPUs (Intel Alder Lake/Raptor Lake, AMD Ryzen): Use physical P-cores
+# For traditional CPUs: Use every other core to avoid hyperthreading
+# For cloud VMs: Use all available cores
+MANUAL_CORES=(0 2 4 6 8 10 12 14)  # Example: 8 physical cores on a 16-thread CPU
+
+# ADVANCED CPU SETTINGS 
+USE_HYPERTHREADING=false           # Set to true to use hyperthread siblings (may slow performance)
+USE_E_CORES=false                  # Set to true to use efficiency cores (slower on hybrid CPUs)
+MAX_CONCURRENT_JOBS=0              # Max parallel jobs (0 = auto based on core count)
+
+# END OF USER CONFIGURATION - DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU'RE DOING
+
+# SECTION 1: THREAD CONTROL - Prevent Oversubscription
+
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export OMP_THREAD_LIMIT=1
+export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1
+
+# SECTION 2: AUTO-DETECT CPU ARCHITECTURE
+
+detect_optimal_cores() {
+    local total_cpus=$(nproc)
+    
+    echo "Detecting optimal CPU cores for your system..."
+    
+    # Check if lscpu is available
+    if command -v lscpu &> /dev/null; then
+        # Look for hybrid architecture (Intel Alder Lake/Raptor Lake, etc.)
+        if lscpu | grep -qi "E-Core\|efficiency"; then
+            echo "  Hybrid architecture detected (P-cores + E-cores)"
+            
+            # Extract P-core numbers (this is complex and CPU-specific)
+            # Fall back to manual specification for hybrid systems
+            echo "  WARNING: Hybrid architecture detected but auto-detection may be inaccurate"
+            echo "  Recommended: Set AUTO_DETECT_CORES=false and specify MANUAL_CORES"
+            echo "  Based on 'lscpu -e' output, use physical P-cores (every other core)"
+            
+            # Simple fallback: use every other core from 0 to total_cpus-1
+            local cores=()
+            for ((i=0; i<total_cpus; i+=2)); do
+                cores+=($i)
+            done
+            echo "${cores[@]}"
+        else
+            # Traditional homogeneous architecture
+            echo "  Homogeneous architecture detected"
+            
+            # Use half the cores (avoid hyperthreading if present)
+            local physical_cores=$(lscpu | grep "^Core(s) per socket:" | awk '{print $4}')
+            local sockets=$(lscpu | grep "^Socket(s):" | awk '{print $2}')
+            local total_physical=$((physical_cores * sockets))
+            
+            if [ $total_physical -lt $total_cpus ]; then
+                # Hyperthreading is active - use physical cores only
+                echo "  Hyperthreading detected: $total_cpus logical, $total_physical physical"
+                local cores=()
+                for ((i=0; i<$total_cpus; i+=2)); do
+                    [ ${#cores[@]} -lt $total_physical ] && cores+=($i)
+                done
+                echo "${cores[@]}"
+            else
+                # No hyperthreading - use all cores
+                seq 0 $((total_cpus - 1))
+            fi
+        fi
+    else
+        # Fallback: use every other core up to total_cpus
+        echo "  lscpu not available, using every other core"
+        for ((i=0; i<total_cpus; i+=2)); do
+            echo -n "$i "
+        done
+        echo
+    fi
+}
+
+# Determine cores to use
+if [ "$AUTO_DETECT_CORES" = true ]; then
+    P_CORES=($(detect_optimal_cores))
+    NUM_JOBS=${#P_CORES[@]}
+else
+    P_CORES=("${MANUAL_CORES[@]}")
+    NUM_JOBS=${#P_CORES[@]}
+fi
+
+# Adjust for hyperthreading and E-core settings
+if [ "$USE_HYPERTHREADING" = true ]; then
+    # Include hyperthread siblings
+    ALL_CORES=()
+    for core in "${P_CORES[@]}"; do
+        ALL_CORES+=($core)
+        ALL_CORES+=$((core + 1))
+    done
+    P_CORES=("${ALL_CORES[@]}")
+    NUM_JOBS=${#P_CORES[@]}
+fi
+
+if [ "$USE_E_CORES" = true ]; then
+    # Add efficiency cores if they exist (cores > 15 typically)
+    TOTAL_CORES=$(nproc)
+    for ((i=16; i<TOTAL_CORES; i++)); do
+        P_CORES+=($i)
+    done
+    NUM_JOBS=${#P_CORES[@]}
+fi
+
+# Apply max concurrent jobs limit
+if [ $MAX_CONCURRENT_JOBS -gt 0 ] && [ $MAX_CONCURRENT_JOBS -lt $NUM_JOBS ]; then
+    NUM_JOBS=$MAX_CONCURRENT_JOBS
+    P_CORES=(${P_CORES[@]:0:$NUM_JOBS})
+fi
+
+# Display system information
+echo "...."
+echo "System Configuration:"
+echo "  Total logical CPUs: $(nproc)"
+echo "  Using ${NUM_JOBS} parallel jobs"
+echo "  Assigned cores: ${P_CORES[@]}"
+echo "  Threads per job: 1 (enforced)"
+echo "  Hyperthreading: $([ "$USE_HYPERTHREADING" = true ] && echo "ENABLED" || echo "disabled")"
+echo "  E-cores: $([ "$USE_E_CORES" = true ] && echo "ENABLED" || echo "disabled")"
+echo "...."
+
+# SECTION 3: BUILD COMMAND LINE ARGUMENTS
+
+# Build metabolite combinations string
+COMBINE_ARGS=""
+for combo in "${COMBINATIONS[@]}"; do
+    COMBINE_ARGS="$COMBINE_ARGS --combine $combo"
+done
+
+# Build macromolecule groups string
+METAB_GROUPS_ARGS=""
+for group in "${METAB_GROUPS[@]}"; do
+    METAB_GROUPS_ARGS="$METAB_GROUPS_ARGS $group"
+done
+
+# Build independent scale groups string
+IND_SCALE_ARGS=""
+for group in "${IND_SCALE_GROUPS[@]}"; do
+    IND_SCALE_ARGS="$IND_SCALE_ARGS $group"
+done
+
+# Build baseline string
+BASELINE_STR="${BASELINE_TYPE}"
+[ -n "$BASELINE_STIFFNESS" ] && BASELINE_STR="${BASELINE_STR}, ${BASELINE_STIFFNESS}"
+
+# Build output flags
+REPORT_FLAG=$([ "$GENERATE_REPORT" = true ] && echo "--report" || echo "")
+EXPORT_SEP_FLAG=$([ "$EXPORT_SEPARATE" = true ] && echo "--export_separate" || echo "")
+EXPORT_BASELINE_FLAG=$([ "$EXPORT_BASELINE" = true ] && echo "--export_baseline" || echo "")
+EXPORT_NO_BASELINE_FLAG=$([ "$EXPORT_NO_BASELINE" = true ] && echo "--export_no_baseline" || echo "")
+VERBOSE_FLAG=$([ "$VERBOSE" = true ] && echo "--verbose" || echo "")
+
+# SECTION 4: CORE PROCESSING FUNCTION
+process_dyn_on_core() {
+    local i=$1
+    local core=$2
+    local i_formatted=$(printf "%02d" $i)
+    
+    # Defensive re-export of thread settings
+    export OMP_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export NUMEXPR_NUM_THREADS=1
+    
+    echo "[$(date '+%H:%M:%S')] Starting Dyn_${i_formatted} on CPU core ${core}"
+    
+    # Build input file paths
+    local data_file="${BASE_DATA_DIR}/${DYNAMIC_PREFIX}${i_formatted}${DYNAMIC_SUFFIX}"
+    local ref_file="${BASE_REF_DIR}/${REF_PREFIX}${i_formatted}${REF_SUFFIX}"
+    local output_dir="${OUTPUT_BASE}/fitted_dyn${i_formatted}/MH${MH_SAMPLES}"
+    
+    # Check if input files exist
+    if [ ! -f "$data_file" ]; then
+        echo "ERROR: Data file not found: $data_file"
+        return 1
+    fi
+    
+    if [ ! -f "$ref_file" ]; then
+        echo "ERROR: Reference file not found: $ref_file"
+        return 1
+    fi
+    
+    # Run fsl_mrs with core pinning
+    taskset -c ${core} fsl_mrs \
+        --data "$data_file" \
+        --basis "$BASIS_DIR" \
+        --output "$output_dir" \
+        --h2o "$ref_file" \
+        --tissue_frac "$TISSUE_JSON" \
+        --algo $ALGO \
+        --TE $TE \
+        --TR $TR \
+        --mh_samples $MH_SAMPLES \
+        --ppmlim $PPM_LIMIT \
+        $COMBINE_ARGS \
+        --metab_groups $METAB_GROUPS_ARGS \
+        --ind_scale $IND_SCALE_ARGS \
+        --baseline "$BASELINE_STR" \
+        $REPORT_FLAG \
+        $EXPORT_SEP_FLAG \
+        $EXPORT_BASELINE_FLAG \
+        $EXPORT_NO_BASELINE_FLAG \
+        $VERBOSE_FLAG
+    
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        echo "[$(date '+%H:%M:%S')] Finished Dyn_${i_formatted} on CPU core ${core}"
+    else
+        echo "[$(date '+%H:%M:%S')] ERROR: Dyn_${i_formatted} failed on CPU core ${core} (exit code: $exit_code)"
+    fi
+    
+    return $exit_code
+}
+
+export -f process_dyn_on_core
+export BASE_DATA_DIR BASE_REF_DIR OUTPUT_BASE BASIS_DIR TISSUE_JSON
+export DYNAMIC_PREFIX DYNAMIC_SUFFIX REF_PREFIX REF_SUFFIX
+export ALGO TE TR MH_SAMPLES PPM_LIMIT BASELINE_STR
+export COMBINE_ARGS METAB_GROUPS_ARGS IND_SCALE_ARGS
+export REPORT_FLAG EXPORT_SEP_FLAG EXPORT_BASELINE_FLAG EXPORT_NO_BASELINE_FLAG VERBOSE_FLAG
+
+# SECTION 5: MAIN PARALLEL EXECUTION LOOP
+
+echo ""
+echo "...."
+echo "Starting parallel processing:"
+echo "  Total dynamics: $NUM_DYNAMICS"
+echo "  Concurrent jobs: $NUM_JOBS"
+echo "  Output directory: $OUTPUT_BASE"
+echo "...."
+echo ""
+
+# Create output base directory if it doesn't exist
+mkdir -p "$OUTPUT_BASE"
+
+# Track start time
+START_TIME=$(date +%s)
+
+# Process dynamics in batches
+SUCCESSFUL=0
+FAILED=0
+
+for i in $(seq 1 $NUM_DYNAMICS); do
+    # Calculate which core to use
+    idx=$(( (i - 1) % NUM_JOBS ))
+    core=${P_CORES[$idx]}
+    
+    echo "Launching Dyn_$(printf "%02d" $i) on core $core"
+    
+    # Start background process
+    process_dyn_on_core $i $core &
+    
+    # Store PID
+    LAST_PID=$!
+    
+    # After launching NUM_JOBS processes, wait for batch to complete
+    if [ $((i % NUM_JOBS)) -eq 0 ]; then
+        echo "Waiting for batch to complete..."
+        wait
+        
+        # Check exit status of all jobs in batch (simple version)
+        # For detailed tracking, you'd need more complex PID management
+    fi
+done
+
+# Wait for any remaining background jobs
+echo "Waiting for final batch to complete..."
+wait
+
+# Calculate total time
+END_TIME=$(date +%s)
+TOTAL_TIME=$((END_TIME - START_TIME))
+MINUTES=$((TOTAL_TIME / 60))
+SECONDS=$((TOTAL_TIME % 60))
+
+# SECTION 6: COMPLETION AND SUMMARY
+
+echo ""
+echo "...."
+echo "Processing Complete!"
+echo "...."
+echo "Total dynamics processed: $NUM_DYNAMICS"
+echo "Parallel jobs used: $NUM_JOBS on cores: ${P_CORES[@]}"
+echo "Total execution time: ${MINUTES}m ${SECONDS}s"
+echo "Output saved to: $OUTPUT_BASE"
+echo "...."
+
+# Provide verification commands
+echo "...."
+echo "To verify correct core usage, run in another terminal:"
+echo "  ps -eLo pid,psr,comm | grep fsl_mrs | sort -k2"
+echo "...."
+echo "To monitor CPU utilization:"
+echo "  mpstat -P ALL 1"
+echo "...."
+echo "To check output quality:"
+echo "  ls -la $OUTPUT_BASE/fitted_dyn*/"
+echo "...."
+
+# TROUBLESHOOTING AND TIPS
+: '
+TROUBLESHOOTING:
+
+1. "taskset: failed to parse CPU list" error:
+   - Check that MANUAL_CORES contains valid core numbers (0 to nproc-1)
+   - Run "lscpu -e" to see available cores on your system
+
+2. Slow performance despite using multiple cores:
+   - Set USE_HYPERTHREADING=false (hyperthreading often slows compute tasks)
+   - Set USE_E_CORES=false (E-cores are slower on hybrid CPUs)
+   - Reduce MAX_CONCURRENT_JOBS to physical core count
+
+3. Out of memory errors:
+   - Each fsl_mrs process uses 1-2 GB RAM
+   - Reduce MAX_CONCURRENT_JOBS to limit RAM usage
+   - Example: MAX_CONCURRENT_JOBS=4 for 8 GB system
+
+4. Input files not found:
+   - Verify DYNAMIC_PREFIX, DYNAMIC_SUFFIX, REF_PREFIX, REF_SUFFIX
+   - Check that dynamic numbers start at 1 (not 0)
+   - Ensure file naming matches exactly (including case)
+
+5. To test without running full processing:
+   - Add "echo" before "taskset" in process_dyn_on_core function
+   - This will print commands without executing them
+
+TIPS FOR OPTIMAL PERFORMANCE:
+
+- For Intel hybrid CPUs (12th-14th gen): Use physical P-cores only (cores 0,2,4,...)
+- For AMD Ryzen: Use half the cores (avoid SMT/ hyperthreading)
+- For cloud VMs (AWS, GCP, Azure): Use all cores (no hyperthreading concerns)
+- For laptops: Reduce MAX_CONCURRENT_JOBS to avoid overheating
+- Always set OMP_NUM_THREADS=1 for multi-process workloads
+
+EXAMPLE CONFIGURATIONS:
+
+# Intel i9-13900K (24 cores: 8 P + 16 E)
+MANUAL_CORES=(0 2 4 6 8 10 12 14)  # 8 physical P-cores
+USE_E_CORES=false
+
+# AMD Ryzen 9 7950X (16 cores, 32 threads)
+MANUAL_CORES=(0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30)  # 16 physical cores
+USE_HYPERTHREADING=false
+
+# AWS c5.4xlarge (16 vCPUs, no hyperthreading)
+AUTO_DETECT_CORES=true  # Will use all 16 cores
+
+# Laptop with 8GB RAM (4 cores, 8 threads)
+MAX_CONCURRENT_JOBS=4   # Limit to 4 jobs to save memory
+MANUAL_CORES=(0 2 4 6)  # Use physical cores only
+=: '
